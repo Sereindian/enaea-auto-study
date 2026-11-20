@@ -1,6 +1,6 @@
 # ENAEA 自动连播助手
 
-[![Version](https://img.shields.io/badge/version-v1.0.3-blue.svg)](https://github.com/Sereindian/enaea-auto-study/releases)
+[![Version](https://img.shields.io/badge/version-v1.0.4-blue.svg)](https://github.com/Sereindian/enaea-auto-study/releases)
 [![Greasy Fork](https://img.shields.io/badge/Greasy%20Fork-606389-670000.svg)](https://greasyfork.org/zh-CN/scripts/606389)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/Sereindian/enaea-auto-study/blob/main/enaea-auto-study.user.js)
 [![Platform](https://img.shields.io/badge/target-estudy.enaea.edu.cn-orange.svg)](https://estudy.enaea.edu.cn/)
@@ -78,6 +78,7 @@
 
 ## 更新日志
 
+- **v1.0.4**：修复平台原生 `ended` 同步切集时误将下一集（如 2% 集数）标记为已完成并跳至再下一集的问题；新增总时长双向匹配校验、95 秒临时缓存自动过期及手动切回未完成集数时自动重置缓存。
 - **v1.0.3**：补充 Greasy Fork 规范元数据（`@license MIT`、作者与仓库链接）并上线 Greasy Fork（#606389）；优化文档结构与安装指引；GitHub Release 改为直接提供 `.user.js` 源码文件。
 - **v1.0.2**：优先续学进行中（1%–99%）的课程与集数，新增真实时长校验防止续播视频因 MSE 缓冲分片误判播完，手动切集/切课不污染已完成缓存。
 - **v1.0.1**：修复手动切 P 与自动切 P 时未同步静音的问题，新增视频事件监听持续保持静音。

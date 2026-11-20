@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ENAEA 新版学习平台自动连播助手 (estudy.enaea.edu.cn)
 // @namespace    https://github.com/Sereindian/enaea-auto-study
-// @version      1.0.3
+// @version      1.0.4
 // @description  支持 estudy.enaea.edu.cn 看完自动切P、完成课程自动切下一课程、看完一章自动切章节、自动锁定1.25倍速播放；遇行为验证/人脸识别自动暂停并提醒人工处理。
 // @author       Sereindian
 // @license      MIT
@@ -21,6 +21,7 @@
   const CONFIG_KEY = "enaea_auto_study_config_v1";
   const SESSION_KEY = "enaea_auto_study_session_v1";
   const PANEL_ID = "enaea-auto-study-hud";
+  const FINISHED_RESOURCE_TTL_MS = 95000;
 
   const DEFAULT_CONFIG = {
     enabled: true,
@@ -135,10 +136,15 @@
     lastUrl: "",
     pageEnteredAt: Date.now(),
     activeEpisodeSig: "",
+    lastEpisodeMeta: null, // { taskId, resourceId, curIdx, curTitle, sig }
     episodeEnteredAt: Date.now(),
     pendingEnd: null, // { sig, at }
     endedVideoSrc: "",
     endedAtEpisodeSig: "",
+    currentEpisodeVideoSrc: "",
+    prevEpisodeVideoSrc: "",
+    sawActivePlaybackOnSig: false,
+    manualResetTarget: null, // { taskId, idx, title, at }
     watchedUnfinished: false,
     playAttemptAt: 0,
     playFailCount: 0,
@@ -603,13 +609,23 @@
     return false;
   }
 
+  function isCachedResourceValid(key, now) {
+    const ts = session.finishedResources[key];
+    if (!ts) return false;
+    if (now - ts < FINISHED_RESOURCE_TTL_MS) return true;
+    delete session.finishedResources[key];
+    saveSession(session);
+    return false;
+  }
+
   function isEpisodeDone(epEl, idx, curIdx, taskId, resourceId) {
     if (isEpisodeDomDone(epEl)) return true;
+    const now = Date.now();
     const title = getEpisodeTitle(epEl);
-    if (taskId && title && session.finishedResources[`${taskId}::ep::${idx}::${title}`]) {
+    if (taskId && title && isCachedResourceValid(`${taskId}::ep::${idx}::${title}`, now)) {
       return true;
     }
-    if (idx === curIdx && taskId && resourceId && session.finishedResources[`${taskId}::res::${resourceId}`]) {
+    if (idx === curIdx && taskId && resourceId && isCachedResourceValid(`${taskId}::res::${resourceId}`, now)) {
       return true;
     }
     return false;
@@ -782,6 +798,62 @@
     };
   }
 
+  function transitionToEpisodeState(meta, now) {
+    if (!meta || runtime.activeEpisodeSig === meta.sig) return;
+    if (runtime.activeEpisodeSig) {
+      const curVid = document.querySelector("#player video");
+      runtime.prevEpisodeVideoSrc = runtime.currentEpisodeVideoSrc || getVideoSrcKey(curVid);
+    }
+    runtime.activeEpisodeSig = meta.sig;
+    runtime.lastEpisodeMeta = meta;
+    runtime.episodeEnteredAt = now;
+    runtime.pendingEnd = null;
+    runtime.sawActivePlaybackOnSig = false;
+    runtime.currentEpisodeVideoSrc = "";
+    runtime.watchedUnfinished = false;
+    runtime.playFailCount = 0;
+
+    if (
+      runtime.manualResetTarget &&
+      now - runtime.manualResetTarget.at < 5000 &&
+      (runtime.manualResetTarget.idx === meta.curIdx || runtime.manualResetTarget.title === meta.curTitle)
+    ) {
+      if (meta.taskId && meta.resourceId && session.finishedResources[`${meta.taskId}::res::${meta.resourceId}`]) {
+        delete session.finishedResources[`${meta.taskId}::res::${meta.resourceId}`];
+        saveSession(session);
+      }
+      runtime.manualResetTarget = null;
+    }
+  }
+
+  function markActivePlaybackIfLive(video) {
+    if (!video) return;
+    if (video.ended) return;
+    const dur = video.duration;
+    if (Number.isFinite(dur) && dur > 5 && video.currentTime >= dur - 2) return;
+    const snap = getActiveEpisodeSnapshot();
+    if (snap && runtime.activeEpisodeSig !== snap.sig) {
+      transitionToEpisodeState(
+        {
+          taskId: snap.taskId,
+          resourceId: snap.resourceId,
+          curIdx: snap.curIdx,
+          curTitle: snap.curTitle,
+          sig: snap.sig,
+        },
+        Date.now()
+      );
+    }
+    const vSrc = getVideoSrcKey(video);
+    runtime.sawActivePlaybackOnSig = true;
+    if (vSrc) {
+      runtime.currentEpisodeVideoSrc = vSrc;
+      if (runtime.prevEpisodeVideoSrc && vSrc !== runtime.prevEpisodeVideoSrc) {
+        runtime.prevEpisodeVideoSrc = "";
+      }
+    }
+  }
+
   function isVideoTrulyFinished(video, curEl, sig, now, fromEndedEvent = false) {
     if (!video) return false;
     const vSrc = getVideoSrcKey(video);
@@ -789,19 +861,30 @@
       runtime.endedAtEpisodeSig &&
       runtime.endedAtEpisodeSig !== sig &&
       (!vSrc || vSrc === runtime.endedVideoSrc) &&
-      now - runtime.episodeEnteredAt < 6000;
+      now - runtime.episodeEnteredAt < 8000;
     if (staleEndedVideo) return false;
+
+    const stalePrevSrc =
+      !runtime.sawActivePlaybackOnSig &&
+      runtime.prevEpisodeVideoSrc &&
+      (!vSrc || vSrc === runtime.prevEpisodeVideoSrc) &&
+      now - runtime.episodeEnteredAt < 8000;
+    if (stalePrevSrc) return false;
 
     const expectedSec = getExpectedEpisodeDurationSec(curEl);
 
+    if (!runtime.sawActivePlaybackOnSig) {
+      if (now - runtime.episodeEnteredAt < 5000) return false;
+      if (expectedSec <= 15) return false;
+    }
+
     if (fromEndedEvent || video.ended) {
-      // Guard against premature MSE chunk 'ended' on resumed (e.g. 4%) episodes whose real duration is larger.
       if (expectedSec > 15) {
-        const durOk = Number.isFinite(video.duration) && video.duration >= expectedSec - 15;
-        const posOk = video.currentTime >= expectedSec - 15;
-        if (!posOk && (!durOk || video.currentTime < video.duration - 2)) {
-          return false;
-        }
+        // Two-sided check blocks both short MSE chunks (e.g. 48s/1215s) and long prev-episode leftovers (e.g. 1806s/1160s).
+        const durMatches = Number.isFinite(video.duration) && Math.abs(video.duration - expectedSec) <= 25;
+        const posMatches =
+          video.currentTime >= expectedSec - 15 && video.currentTime <= expectedSec + 25;
+        if (!durMatches || !posMatches) return false;
       }
       return true;
     }
@@ -812,9 +895,10 @@
     if (video.currentTime < video.duration - 0.6) return false;
 
     if (expectedSec > 15) {
-      if (video.duration < expectedSec - 15 || video.currentTime < expectedSec - 15) {
-        return false;
-      }
+      const durMatches = Math.abs(video.duration - expectedSec) <= 25;
+      const posMatches =
+        video.currentTime >= expectedSec - 15 && video.currentTime <= expectedSec + 25;
+      if (!durMatches || !posMatches) return false;
     } else if (now - runtime.episodeEnteredAt < 3000) {
       return false;
     }
@@ -903,6 +987,10 @@
       ensureMuted(video);
     };
 
+    const onCheckActivePlayback = () => {
+      markActivePlaybackIfLive(video);
+    };
+
     video.addEventListener("ratechange", onNeedLockRate);
     video.addEventListener("loadedmetadata", onNeedLockRate);
     video.addEventListener("play", onNeedLockRate);
@@ -912,18 +1000,41 @@
     video.addEventListener("playing", onNeedMute);
     video.addEventListener("volumechange", onNeedMute);
 
+    video.addEventListener("loadedmetadata", onCheckActivePlayback);
+    video.addEventListener("play", onCheckActivePlayback);
+    video.addEventListener("playing", onCheckActivePlayback);
+    video.addEventListener("timeupdate", onCheckActivePlayback);
+
     video.addEventListener("ended", () => {
       if (!config.enabled) return;
       const snap = getActiveEpisodeSnapshot();
       if (!snap) return;
       const now = Date.now();
-      if (!isVideoTrulyFinished(video, snap.curEl, snap.sig, now, true)) return;
       const vSrc = getVideoSrcKey(video);
+
+      // ENAEA's native handleEnd() may synchronously move data-checked to the next episode before our listener runs.
+      if (runtime.activeEpisodeSig && snap.sig !== runtime.activeEpisodeSig) {
+        if (runtime.lastEpisodeMeta) {
+          markEpisodeFinished(
+            runtime.lastEpisodeMeta.taskId,
+            runtime.lastEpisodeMeta.resourceId,
+            runtime.lastEpisodeMeta.curIdx,
+            runtime.lastEpisodeMeta.curTitle
+          );
+        }
+        runtime.prevEpisodeVideoSrc = vSrc;
+        runtime.endedVideoSrc = vSrc;
+        runtime.endedAtEpisodeSig = runtime.activeEpisodeSig;
+        return;
+      }
+
+      if (!isVideoTrulyFinished(video, snap.curEl, snap.sig, now, true)) return;
       markEpisodeFinished(snap.taskId, snap.resourceId, snap.curIdx, snap.curTitle);
       runtime.endedVideoSrc = vSrc;
       runtime.endedAtEpisodeSig = snap.sig;
       if (!runtime.pendingEnd) {
         runtime.pendingEnd = { sig: snap.sig, at: now };
+        window.setTimeout(tick, 3050);
       }
     });
   }
@@ -995,11 +1106,7 @@
     const curTitle = getEpisodeTitle(curEl);
     const sig = `${taskId}|${resourceId}|${curIdx}|${curTitle}`;
     if (runtime.activeEpisodeSig !== sig) {
-      runtime.activeEpisodeSig = sig;
-      runtime.episodeEnteredAt = now;
-      runtime.pendingEnd = null;
-      runtime.watchedUnfinished = false;
-      runtime.playFailCount = 0;
+      transitionToEpisodeState({ taskId, resourceId, curIdx, curTitle, sig }, now);
     }
 
     // Wait out the 3s end grace period so native endSessionId/sensorsData finish flushing.
@@ -1019,6 +1126,7 @@
     const playerVideo = document.querySelector("#player video");
     if (playerVideo) {
       bindVideoEventsOnce(playerVideo);
+      markActivePlaybackIfLive(playerVideo);
       ensureMuted(playerVideo);
     }
 
@@ -1058,18 +1166,21 @@
       runtime.endedAtEpisodeSig &&
       runtime.endedAtEpisodeSig !== sig &&
       (!vSrc || vSrc === runtime.endedVideoSrc) &&
-      now - runtime.episodeEnteredAt < 6000;
+      now - runtime.episodeEnteredAt < 8000;
 
     if (staleEndedVideo && video.ended) {
       setStatus("RUNNING", `等待切换新视频源 (${curTitle})...`);
       return;
     }
 
+    markActivePlaybackIfLive(video);
+
     if (isVideoTrulyFinished(video, curEl, sig, now, false)) {
       markEpisodeFinished(taskId, resourceId, curIdx, curTitle);
       runtime.endedVideoSrc = vSrc;
       runtime.endedAtEpisodeSig = sig;
       runtime.pendingEnd = { sig, at: now };
+      window.setTimeout(tick, 3050);
       setStatus("RUNNING", `本集已播完，准备切换 (${curTitle})`);
       return;
     }
@@ -1329,14 +1440,45 @@
 
   // --- Main State Machine Tick ---
 
+  function getCourseRouteIdentity(urlStr) {
+    try {
+      const u = new URL(urlStr, window.location.origin);
+      const sp = new URLSearchParams(u.search);
+      return {
+        pathname: u.pathname,
+        taskId: sp.get("task_id") || sp.get("course_id") || "",
+      };
+    } catch (_) {
+      return { pathname: "", taskId: "" };
+    }
+  }
+
   function onUrlChanged(newUrl) {
+    const prevId = runtime.lastUrl ? getCourseRouteIdentity(runtime.lastUrl) : { pathname: "", taskId: "" };
+    const nextId = getCourseRouteIdentity(newUrl);
+    const sameCoursePlayer =
+      getRouteKind(nextId.pathname) === "player" &&
+      prevId.pathname === nextId.pathname &&
+      prevId.taskId &&
+      prevId.taskId === nextId.taskId;
+
     runtime.lastUrl = newUrl;
+    if (sameCoursePlayer) {
+      // Switching resource_id within the same course: let handlePlayerPage transition episode state while keeping stale-src guards intact.
+      return;
+    }
+
     runtime.pageEnteredAt = Date.now();
     runtime.activeEpisodeSig = "";
+    runtime.lastEpisodeMeta = null;
     runtime.episodeEnteredAt = Date.now();
     runtime.pendingEnd = null;
     runtime.endedVideoSrc = "";
     runtime.endedAtEpisodeSig = "";
+    runtime.currentEpisodeVideoSrc = "";
+    runtime.prevEpisodeVideoSrc = "";
+    runtime.sawActivePlaybackOnSig = false;
+    runtime.manualResetTarget = null;
     runtime.watchedUnfinished = false;
     runtime.playFailCount = 0;
     runtime.lastRateApplyAt = 0;
@@ -1746,9 +1888,64 @@
     } catch (_) {}
   }
 
+  function findEpisodeItemFromTarget(target) {
+    let cur = target;
+    let epEl = null;
+    let inPlaylist = false;
+    while (cur && cur.nodeType === 1) {
+      const cls = String(cur.className || "");
+      if (!epEl && cur.hasAttribute && cur.hasAttribute("data-checked") && cls.includes("item-wrap_")) {
+        epEl = cur;
+      }
+      if (cls.includes("play-list-wrap_")) {
+        inPlaylist = true;
+        break;
+      }
+      cur = cur.parentElement;
+    }
+    return epEl && inPlaylist ? epEl : null;
+  }
+
+  function bindManualEpisodeClickReset() {
+    document.addEventListener(
+      "click",
+      (e) => {
+        if (!e || e.isTrusted !== true) return;
+        const epEl = findEpisodeItemFromTarget(e.target);
+        if (!epEl || isEpisodeDomDone(epEl)) return;
+
+        const wrap = getPlaylistWrap();
+        const episodes = wrap
+          ? Array.from(wrap.querySelectorAll('div[class*="item-wrap_"][data-checked]'))
+          : [];
+        const idx = episodes.indexOf(epEl);
+        const title = getEpisodeTitle(epEl);
+        const p = getQueryParams();
+        const taskId = p.get("task_id") || p.get("course_id") || "";
+
+        let cleared = false;
+        if (taskId && idx >= 0 && title) {
+          const eKey = `${taskId}::ep::${idx}::${title}`;
+          if (session.finishedResources[eKey]) {
+            delete session.finishedResources[eKey];
+            cleared = true;
+          }
+        }
+        // Also clear any resource_id match once handlePlayerPage resolves the newly selected sig
+        runtime.manualResetTarget = { taskId, idx, title, at: Date.now() };
+        if (cleared) {
+          saveSession(session);
+          pushLog(`👆 检测到手动切回未完成集数，已重置缓存 (${title})`);
+        }
+      },
+      true
+    );
+  }
+
   function start() {
     injectHUD();
     hookHistoryEvents();
+    bindManualEpisodeClickReset();
     pushLog("🚀 脚本已就绪");
     tick();
     window.setInterval(() => {
