@@ -1,9 +1,12 @@
 // ==UserScript==
 // @name         ENAEA 新版学习平台自动连播助手 (estudy.enaea.edu.cn)
-// @namespace    https://estudy.enaea.edu.cn/
-// @version      1.0.2
-// @description  支持 estudy.enaea.edu.cn 看完自动切P、完成课程自动切下一课程、看完一章自动切章节；遇行为验证/人脸识别自动暂停并提醒人工处理。
-// @author       Course Completion Assistant
+// @namespace    https://github.com/Sereindian/enaea-auto-study
+// @version      1.0.3
+// @description  支持 estudy.enaea.edu.cn 看完自动切P、完成课程自动切下一课程、看完一章自动切章节、自动锁定1.25倍速播放；遇行为验证/人脸识别自动暂停并提醒人工处理。
+// @author       Sereindian
+// @license      MIT
+// @homepageURL  https://github.com/Sereindian/enaea-auto-study
+// @supportURL   https://github.com/Sereindian/enaea-auto-study/issues
 // @match        https://estudy.enaea.edu.cn/*
 // @grant        GM_getValue
 // @grant        GM_setValue
