@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax check userscript
+        run: node --check enaea-auto-study.user.js
+
+      - name: Package release assets
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          cp enaea-auto-study.user.js dist/enaea-auto-study.user.js
+          zip -j "dist/enaea-auto-study-${TAG}.zip" enaea-auto-study.user.js README.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          git tag -l --format='%(contents)' "$TAG" > release-notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/enaea-auto-study.user.js "dist/enaea-auto-study-${TAG}.zip" --clobber
+          elif grep -q '[^[:space:]]' release-notes.md; then
+            gh release create "$TAG" dist/enaea-auto-study.user.js "dist/enaea-auto-study-${TAG}.zip" \
+              --title "ENAEA Auto Study ${TAG}" \
+              --notes-file release-notes.md
+          else
+            gh release create "$TAG" dist/enaea-auto-study.user.js "dist/enaea-auto-study-${TAG}.zip" \
+              --title "ENAEA Auto Study ${TAG}" \
+              --generate-notes
+          fi
