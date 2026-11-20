@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ENAEA 新版学习平台自动连播助手 (estudy.enaea.edu.cn)
 // @namespace    https://estudy.enaea.edu.cn/
-// @version      1.0.1
+// @version      1.0.2
 // @description  支持 estudy.enaea.edu.cn 看完自动切P、完成课程自动切下一课程、看完一章自动切章节；遇行为验证/人脸识别自动暂停并提醒人工处理。
 // @author       Course Completion Assistant
 // @match        https://estudy.enaea.edu.cn/*
@@ -522,9 +522,74 @@
     return wrap;
   }
 
+  function parseDurationTextSec(text) {
+    const raw = (text || "").replace(/\s+/g, " ").trim();
+    if (!raw) return 0;
+
+    // Match Chinese format like "1 时 05 分 26 秒" / "20 分 15 秒" / "45 秒"
+    const cnMatch = raw.match(/(?:(\d+)\s*时)?\s*(?:(\d+)\s*分)?\s*(?:(\d+)\s*秒)?/);
+    if (cnMatch && (cnMatch[1] || cnMatch[2] || cnMatch[3])) {
+      const h = Number(cnMatch[1] || 0);
+      const m = Number(cnMatch[2] || 0);
+      const s = Number(cnMatch[3] || 0);
+      const total = h * 3600 + m * 60 + s;
+      if (total > 0) return total;
+    }
+
+    // Match colon format like "20:15" or "01:05:26"
+    const colonMatch = raw.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if (colonMatch) {
+      if (colonMatch[3] !== undefined) {
+        return Number(colonMatch[1]) * 3600 + Number(colonMatch[2]) * 60 + Number(colonMatch[3]);
+      }
+      return Number(colonMatch[1]) * 60 + Number(colonMatch[2]);
+    }
+    return 0;
+  }
+
+  function parseProgressPercent(text, containerEl) {
+    const clean = (text || "").replace(/\s+/g, "").trim();
+    if (clean === "完成" || clean === "100%") return 100;
+    const m = clean.match(/(\d+(?:\.\d+)?)\s*%/);
+    if (m) return Number(m[1]);
+    if (containerEl) {
+      const prog = containerEl.querySelector('[role="progressbar"][aria-valuenow]');
+      if (prog) {
+        const val = Number(prog.getAttribute("aria-valuenow"));
+        if (Number.isFinite(val)) return val;
+      }
+    }
+    return null;
+  }
+
   function getEpisodeTitle(epEl) {
     const nameEl = epEl.querySelector('[class*="name-span_"]');
     return normText(nameEl || epEl);
+  }
+
+  function getExpectedEpisodeDurationSec(epEl) {
+    let maxSec = 0;
+    if (epEl) {
+      const infoEl = epEl.querySelector('[class*="item-info_"]');
+      if (infoEl) {
+        maxSec = Math.max(maxSec, parseDurationTextSec(infoEl.textContent));
+      }
+    }
+    const timeEl = document.querySelector("#player .xgplayer-time, .xgplayer-time");
+    if (timeEl) {
+      const parts = normText(timeEl).split("/");
+      if (parts.length >= 2) {
+        maxSec = Math.max(maxSec, parseDurationTextSec(parts[parts.length - 1]));
+      }
+    }
+    return maxSec;
+  }
+
+  function getEpisodeProgressPercent(epEl) {
+    if (isEpisodeDomDone(epEl)) return 100;
+    const rateEl = epEl.querySelector('[class*="rate-span_"]');
+    const pct = parseProgressPercent(rateEl ? rateEl.textContent : "", epEl);
+    return pct === null ? 0 : pct;
   }
 
   function isEpisodeDomDone(epEl) {
@@ -574,13 +639,15 @@
     return btns.find((el) => isVisible(el) && normText(el).includes("下一个课程")) || null;
   }
 
-  function advanceToNextCourse(now) {
+  function advanceToNextCourse(now, { markFinished = true } = {}) {
     const params = getQueryParams();
     const taskId = params.get("task_id") || params.get("course_id") || "";
     const courseTitle = getCurrentCourseTitle();
-    markCourseFinished(taskId, courseTitle);
+    if (markFinished) {
+      markCourseFinished(taskId, courseTitle);
+    }
 
-    if (!runtime.watchedUnfinished) {
+    if (!runtime.watchedUnfinished && markFinished) {
       session.consecutiveCompletedHops = (session.consecutiveCompletedHops || 0) + 1;
       saveSession(session);
     }
@@ -599,11 +666,11 @@
 
     runtime.waitingCourseSwitch = { beforeUrl: window.location.href, at: now };
     nextBtn.click();
-    pushLog("⏭️ 本课全部集数已完成，点击「下一个课程」");
+    pushLog(markFinished ? "⏭️ 本课全部集数已完成，点击「下一个课程」" : "⏭️ 手动切换「下一个课程」");
     setStatus("RUNNING", "正在切换至下一课程...");
   }
 
-  function advanceToNextEpisodeOrCourse(now) {
+  function advanceToNextEpisodeOrCourse(now, { isManual = false } = {}) {
     const wrap = ensurePlaylistTabAndExpanded(now);
     if (!wrap) return false;
 
@@ -615,20 +682,28 @@
     const resourceId = params.get("resource_id") || "";
     const curIdx = episodes.findIndex((el) => el.getAttribute("data-checked") === "true");
 
-    let nextTarget = null;
+    const orderedCandidates = [];
     for (let i = curIdx + 1; i < episodes.length; i++) {
       if (!isEpisodeDone(episodes[i], i, curIdx, taskId, resourceId)) {
-        nextTarget = episodes[i];
-        break;
+        orderedCandidates.push(episodes[i]);
       }
     }
-    if (!nextTarget) {
-      for (let i = 0; i < curIdx; i++) {
-        if (!isEpisodeDone(episodes[i], i, curIdx, taskId, resourceId)) {
-          nextTarget = episodes[i];
-          break;
-        }
+    for (let i = 0; i < curIdx; i++) {
+      if (!isEpisodeDone(episodes[i], i, curIdx, taskId, resourceId)) {
+        orderedCandidates.push(episodes[i]);
       }
+    }
+
+    let nextTarget = null;
+    if (!isManual && orderedCandidates.length > 0) {
+      // Prioritize resuming already-started (1%–99%) episodes before starting new 0% ones.
+      nextTarget =
+        orderedCandidates.find((el) => {
+          const pct = getEpisodeProgressPercent(el);
+          return pct > 0 && pct < 100;
+        }) || orderedCandidates[0];
+    } else if (orderedCandidates.length > 0) {
+      nextTarget = orderedCandidates[0];
     }
 
     if (nextTarget) {
@@ -638,12 +713,12 @@
         nextTarget.scrollIntoView({ block: "nearest" });
       }
       nextTarget.click();
-      pushLog(`🎬 自动切P -> ${nextTitle || "下一集"}`);
+      pushLog(`🎬 ${isManual ? "手动" : "自动"}切P -> ${nextTitle || "下一集"}`);
       setStatus("RUNNING", `切换至: ${nextTitle || "下一集"}`);
       return true;
     }
 
-    advanceToNextCourse(now);
+    advanceToNextCourse(now, { markFinished: !isManual });
     return true;
   }
 
@@ -689,7 +764,8 @@
     const episodes = Array.from(wrap.querySelectorAll('div[class*="item-wrap_"][data-checked]'));
     const curIdx = episodes.findIndex((el) => el.getAttribute("data-checked") === "true");
     if (curIdx === -1) return null;
-    const curTitle = getEpisodeTitle(episodes[curIdx]);
+    const curEl = episodes[curIdx];
+    const curTitle = getEpisodeTitle(curEl);
     const p = getQueryParams();
     const taskId = p.get("task_id") || p.get("course_id") || "";
     const resourceId = p.get("resource_id") || "";
@@ -697,9 +773,50 @@
       taskId,
       resourceId,
       curIdx,
+      curEl,
       curTitle,
       sig: `${taskId}|${resourceId}|${curIdx}|${curTitle}`,
     };
+  }
+
+  function isVideoTrulyFinished(video, curEl, sig, now, fromEndedEvent = false) {
+    if (!video) return false;
+    const vSrc = getVideoSrcKey(video);
+    const staleEndedVideo =
+      runtime.endedAtEpisodeSig &&
+      runtime.endedAtEpisodeSig !== sig &&
+      (!vSrc || vSrc === runtime.endedVideoSrc) &&
+      now - runtime.episodeEnteredAt < 6000;
+    if (staleEndedVideo) return false;
+
+    const expectedSec = getExpectedEpisodeDurationSec(curEl);
+
+    if (fromEndedEvent || video.ended) {
+      // Guard against premature MSE chunk 'ended' on resumed (e.g. 4%) episodes whose real duration is larger.
+      if (expectedSec > 15) {
+        const durOk = Number.isFinite(video.duration) && video.duration >= expectedSec - 15;
+        const posOk = video.currentTime >= expectedSec - 15;
+        if (!posOk && (!durOk || video.currentTime < video.duration - 2)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    if (video.seeking) return false;
+    if (video.readyState !== undefined && video.readyState < 2) return false;
+    if (!Number.isFinite(video.duration) || video.duration <= 5) return false;
+    if (video.currentTime < video.duration - 0.6) return false;
+
+    if (expectedSec > 15) {
+      if (video.duration < expectedSec - 15 || video.currentTime < expectedSec - 15) {
+        return false;
+      }
+    } else if (now - runtime.episodeEnteredAt < 3000) {
+      return false;
+    }
+
+    return true;
   }
 
   function findOfficialRate125Option() {
@@ -796,22 +913,14 @@
       if (!config.enabled) return;
       const snap = getActiveEpisodeSnapshot();
       if (!snap) return;
-      // Ignore stale ended event if xgplayer hasn't swapped src after switching episodes.
+      const now = Date.now();
+      if (!isVideoTrulyFinished(video, snap.curEl, snap.sig, now, true)) return;
       const vSrc = getVideoSrcKey(video);
-      if (
-        runtime.endedAtEpisodeSig &&
-        runtime.endedAtEpisodeSig !== snap.sig &&
-        vSrc &&
-        vSrc === runtime.endedVideoSrc &&
-        Date.now() - runtime.episodeEnteredAt < 6000
-      ) {
-        return;
-      }
       markEpisodeFinished(snap.taskId, snap.resourceId, snap.curIdx, snap.curTitle);
       runtime.endedVideoSrc = vSrc;
       runtime.endedAtEpisodeSig = snap.sig;
       if (!runtime.pendingEnd) {
-        runtime.pendingEnd = { sig: snap.sig, at: Date.now() };
+        runtime.pendingEnd = { sig: snap.sig, at: now };
       }
     });
   }
@@ -945,21 +1054,15 @@
     const staleEndedVideo =
       runtime.endedAtEpisodeSig &&
       runtime.endedAtEpisodeSig !== sig &&
-      vSrc &&
-      vSrc === runtime.endedVideoSrc &&
+      (!vSrc || vSrc === runtime.endedVideoSrc) &&
       now - runtime.episodeEnteredAt < 6000;
 
-    const nearEnd =
-      Number.isFinite(video.duration) &&
-      video.duration > 5 &&
-      video.currentTime >= video.duration - 0.6;
-
-    if (staleEndedVideo && (video.ended || nearEnd)) {
+    if (staleEndedVideo && video.ended) {
       setStatus("RUNNING", `等待切换新视频源 (${curTitle})...`);
       return;
     }
 
-    if (video.ended || nearEnd) {
+    if (isVideoTrulyFinished(video, curEl, sig, now, false)) {
       markEpisodeFinished(taskId, resourceId, curIdx, curTitle);
       runtime.endedVideoSrc = vSrc;
       runtime.endedAtEpisodeSig = sig;
@@ -968,7 +1071,7 @@
       return;
     }
 
-    if (runtime.endedVideoSrc && (!video.ended && !nearEnd)) {
+    if (runtime.endedVideoSrc && !video.ended) {
       runtime.endedVideoSrc = "";
       runtime.endedAtEpisodeSig = "";
     }
@@ -998,13 +1101,27 @@
 
   // --- Course List & Chapter Switching State Machine ---
 
-  function isCourseBoxDone(box) {
+  function getCourseProgressPercent(box) {
     const label = box.querySelector('[class*="progress-label_"]');
-    if (label && isProgressTextDone(label.textContent)) return true;
-    const prog = box.querySelector('[role="progressbar"][aria-valuenow]');
-    if (prog && Number(prog.getAttribute("aria-valuenow")) >= 100) return true;
+    return parseProgressPercent(label ? label.textContent : "", box);
+  }
+
+  function isCourseBoxDone(box) {
+    const pct = getCourseProgressPercent(box);
+    if (pct !== null && pct >= 100) return true;
+
     const title = getCourseTitleFromBox(box);
-    if (title && session.finishedCourses[title]) return true;
+    if (title && session.finishedCourses[title]) {
+      // Never skip a course if the live DOM clearly shows it is still < 90% (e.g. 4%).
+      if (pct !== null && pct < 90) {
+        delete session.finishedCourses[title];
+        saveSession(session);
+        return false;
+      }
+      if (Date.now() - session.finishedCourses[title] < 180000) {
+        return true;
+      }
+    }
     return false;
   }
 
@@ -1046,16 +1163,18 @@
       return;
     }
 
+    // Pass 1: expand all Level-1 and Level-2 chapters so we can prioritize any already-started (1%-99%) course.
     for (const l1Panel of level1Panels) {
       const l1Title = normText(getDirectHeader(l1Panel));
       if (!isCollapseExpanded(l1Panel)) {
         if (now < runtime.expandCooldownUntil) return;
         const hdr = getDirectHeader(l1Panel);
         if (hdr) {
-          runtime.expandCooldownUntil = now + 800;
+          runtime.expandCooldownUntil = now + 250;
           hdr.click();
           pushLog(`📂 展开一级板块: ${l1Title}`);
           setStatus("RUNNING", `展开板块: ${l1Title}`);
+          window.setTimeout(tick, 280);
           return;
         }
       }
@@ -1067,37 +1186,62 @@
         : null;
       const level2Panels = getDirectCollapseItems(l2Collapse);
 
+      for (const l2Panel of level2Panels) {
+        const l2Title = normText(getDirectHeader(l2Panel));
+        if (!isCollapseExpanded(l2Panel)) {
+          if (now < runtime.expandCooldownUntil) return;
+          const hdr = getDirectHeader(l2Panel);
+          if (hdr) {
+            runtime.expandCooldownUntil = now + 250;
+            hdr.click();
+            pushLog(`📁 展开章节: ${l2Title}`);
+            setStatus("RUNNING", `展开章节: ${l2Title}`);
+            window.setTimeout(tick, 280);
+            return;
+          }
+        }
+      }
+    }
+
+    // Pass 2: collect all unfinished & unskipped courses across all expanded chapters.
+    const unfinished = [];
+    for (const l1Panel of level1Panels) {
+      const l1Title = normText(getDirectHeader(l1Panel));
+      const l1Content = getDirectContent(l1Panel) || l1Panel;
+      const secondInfo = l1Content.querySelector('[class*="sectionSecond-info_"]');
+      const l2Collapse = secondInfo
+        ? secondInfo.querySelector(".grt-collapse, .ant-collapse")
+        : null;
+      const level2Panels = getDirectCollapseItems(l2Collapse);
+
       if (level2Panels.length > 0) {
         for (const l2Panel of level2Panels) {
           const l2Title = normText(getDirectHeader(l2Panel));
-          if (!isCollapseExpanded(l2Panel)) {
-            if (now < runtime.expandCooldownUntil) return;
-            const hdr = getDirectHeader(l2Panel);
-            if (hdr) {
-              runtime.expandCooldownUntil = now + 800;
-              hdr.click();
-              pushLog(`📁 切换章节: ${l2Title}`);
-              setStatus("RUNNING", `展开章节: ${l2Title}`);
-              return;
-            }
-          }
-
           const l2Content = getDirectContent(l2Panel) || l2Panel;
           const boxes = Array.from(l2Content.querySelectorAll('[class*="section-box_"]'));
-          const target = boxes.find((b) => !isCourseBoxDone(b) && !isCourseSkipped(b));
-          if (target) {
-            clickCourseCard(target, l2Title, now);
-            return;
+          for (const b of boxes) {
+            if (!isCourseBoxDone(b) && !isCourseSkipped(b)) {
+              unfinished.push({ box: b, chapterLabel: l2Title, pct: getCourseProgressPercent(b) });
+            }
           }
         }
       } else {
         const boxes = Array.from(l1Content.querySelectorAll('[class*="section-box_"]'));
-        const target = boxes.find((b) => !isCourseBoxDone(b) && !isCourseSkipped(b));
-        if (target) {
-          clickCourseCard(target, l1Title, now);
-          return;
+        for (const b of boxes) {
+          if (!isCourseBoxDone(b) && !isCourseSkipped(b)) {
+            unfinished.push({ box: b, chapterLabel: l1Title, pct: getCourseProgressPercent(b) });
+          }
         }
       }
+    }
+
+    if (unfinished.length > 0) {
+      const inProgress = unfinished.find(
+        (item) => item.pct !== null && item.pct > 0 && item.pct < 100
+      );
+      const chosen = inProgress || unfinished[0];
+      clickCourseCard(chosen.box, chosen.chapterLabel, now);
+      return;
     }
 
     config.enabled = false;
@@ -1114,9 +1258,13 @@
       return;
     }
 
-    const target = cards.find((c) => !isCourseBoxDone(c) && !isCourseSkipped(c));
-    if (target) {
-      clickCourseCard(target, "", now);
+    const unfinished = cards.filter((c) => !isCourseBoxDone(c) && !isCourseSkipped(c));
+    if (unfinished.length > 0) {
+      const inProgress = unfinished.find((c) => {
+        const pct = getCourseProgressPercent(c);
+        return pct !== null && pct > 0 && pct < 100;
+      });
+      clickCourseCard(inProgress || unfinished[0], "", now);
       return;
     }
 
@@ -1516,7 +1664,7 @@
         pushLog("ℹ️ 当前不在播放页");
         return;
       }
-      advanceToNextEpisodeOrCourse(Date.now());
+      advanceToNextEpisodeOrCourse(Date.now(), { isManual: true });
     });
 
     panel.querySelector('[data-act="nextCourse"]').addEventListener("click", () => {
@@ -1524,7 +1672,7 @@
         pushLog("ℹ️ 当前不在播放页");
         return;
       }
-      advanceToNextCourse(Date.now());
+      advanceToNextCourse(Date.now(), { markFinished: false });
     });
 
     panel.querySelector('[data-act="clearCache"]').addEventListener("click", () => {
