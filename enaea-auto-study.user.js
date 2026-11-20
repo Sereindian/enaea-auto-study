@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ENAEA 新版学习平台自动连播助手 (estudy.enaea.edu.cn)
 // @namespace    https://estudy.enaea.edu.cn/
-// @version      1.0.0
+// @version      1.0.1
 // @description  支持 estudy.enaea.edu.cn 看完自动切P、完成课程自动切下一课程、看完一章自动切章节；遇行为验证/人脸识别自动暂停并提醒人工处理。
 // @author       Course Completion Assistant
 // @match        https://estudy.enaea.edu.cn/*
@@ -141,6 +141,7 @@
     playFailCount: 0,
     lastRateApplyAt: 0,
     applyingRate: false,
+    applyingMute: false,
     rateUnsupportedLoggedFor: "",
     modalActionAt: 0,
     expandCooldownUntil: 0,
@@ -755,6 +756,17 @@
     }
   }
 
+  function ensureMuted(video) {
+    if (!config.autoMute || !video || runtime.applyingMute) return;
+    if (video.muted) return;
+    runtime.applyingMute = true;
+    try {
+      video.muted = true;
+    } finally {
+      runtime.applyingMute = false;
+    }
+  }
+
   function bindVideoEventsOnce(video) {
     if (boundVideos.has(video)) return;
     boundVideos.add(video);
@@ -766,9 +778,19 @@
       ensureLockedPlaybackRate(video, Date.now(), tId, true);
     };
 
+    const onNeedMute = () => {
+      if (!config.enabled || !config.autoMute) return;
+      ensureMuted(video);
+    };
+
     video.addEventListener("ratechange", onNeedLockRate);
     video.addEventListener("loadedmetadata", onNeedLockRate);
     video.addEventListener("play", onNeedLockRate);
+
+    video.addEventListener("loadedmetadata", onNeedMute);
+    video.addEventListener("play", onNeedMute);
+    video.addEventListener("playing", onNeedMute);
+    video.addEventListener("volumechange", onNeedMute);
 
     video.addEventListener("ended", () => {
       if (!config.enabled) return;
@@ -882,6 +904,12 @@
       }
     }
 
+    const playerVideo = document.querySelector("#player video");
+    if (playerVideo) {
+      bindVideoEventsOnce(playerVideo);
+      ensureMuted(playerVideo);
+    }
+
     // If current episode is already marked finished in DOM or session cache, jump ahead.
     if (isEpisodeDone(curEl, curIdx, curIdx, taskId, resourceId)) {
       if (now - runtime.episodeEnteredAt >= 2000) {
@@ -894,7 +922,7 @@
 
     // Document resource (resource_type === 5) has no video element.
     const docWrap = document.querySelector('[class*="doc-wrap_"]');
-    const video = document.querySelector("#player video");
+    const video = playerVideo || document.querySelector("#player video");
     if (docWrap && isVisible(docWrap) && !video) {
       if (now - runtime.episodeEnteredAt >= 5000) {
         runtime.watchedUnfinished = true;
@@ -912,8 +940,6 @@
       setStatus("RUNNING", "等待视频播放器就绪...");
       return;
     }
-
-    bindVideoEventsOnce(video);
 
     const vSrc = getVideoSrcKey(video);
     const staleEndedVideo =
@@ -947,6 +973,7 @@
       runtime.endedAtEpisodeSig = "";
     }
 
+    ensureMuted(video);
     ensureLockedPlaybackRate(video, now, taskId, false);
 
     if (!video.paused && video.currentTime > 1) {
@@ -1464,6 +1491,13 @@
           const v = document.querySelector("#player video");
           const tId = getQueryParams().get("task_id") || getQueryParams().get("course_id") || "";
           if (v) ensureLockedPlaybackRate(v, Date.now(), tId, true);
+        }
+        if (key === "autoMute") {
+          const v = document.querySelector("#player video");
+          if (v) {
+            if (input.checked) ensureMuted(v);
+            else v.muted = false;
+          }
         }
       });
     });
